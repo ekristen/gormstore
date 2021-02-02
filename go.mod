@@ -10,4 +10,5 @@ require (
 	github.com/jinzhu/gorm v1.9.12
 	github.com/lib/pq v1.3.0
 	github.com/mattn/go-sqlite3 v2.0.3+incompatible
+	gorm.io/gorm v1.20.12 // indirect
 )

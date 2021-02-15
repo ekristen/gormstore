@@ -3,6 +3,7 @@
 package gormstore
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -13,13 +14,14 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/jinzhu/gorm"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 // default test db
-var dbURI = "sqlite3://file:dummy?mode=memory&cache=shared"
+var dbURI = "file::memory:?cache=shared"
 
 // TODO: this is ugly
 func parseCookies(value string) map[string]*http.Cookie {
@@ -30,40 +32,15 @@ func parseCookies(value string) map[string]*http.Cookie {
 	return m
 }
 
-func connectDbURI(uri string) (*gorm.DB, error) {
-	parts := strings.SplitN(uri, "://", 2)
-	driver := parts[0]
-	dsn := parts[1]
-
-	var err error
-	// retry to give some time for db to be ready
-	for i := 0; i < 50; i++ {
-		var db *gorm.DB
-		db, err = gorm.Open(driver, dsn)
-		if err == nil {
-			return db, nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	return nil, err
-}
-
 // create new shared in memory db
-func newDB() *gorm.DB {
-	var err error
-	var db *gorm.DB
-	if db, err = connectDbURI(dbURI); err != nil {
+func newDB(uri string) *gorm.DB {
+	db, err := gorm.Open(sqlite.Open(uri), &gorm.Config{})
+	if err != nil {
 		panic(err)
 	}
 
-	// db.LogMode(true)
-
 	// cleanup db
-	if err := db.DropTableIfExists(
-		&gormSession{tableName: "abc"},
-		&gormSession{tableName: "sessions"},
-	).Error; err != nil {
+	if err := db.Migrator().DropTable("abc", "sessions"); err != nil {
 		panic(err)
 	}
 
@@ -92,7 +69,7 @@ func match(t *testing.T, resp *httptest.ResponseRecorder, code int, body string)
 
 func findSession(db *gorm.DB, store *Store, id string) *gormSession {
 	s := &gormSession{tableName: store.opts.TableName}
-	if db.Where("id = ?", id).First(s).RecordNotFound() {
+	if err := db.Where("id = ?", id).First(s).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}
 	return s
@@ -118,7 +95,7 @@ func makeCountHandler(name string, store *Store) http.HandlerFunc {
 }
 
 func TestBasic(t *testing.T) {
-	countFn := makeCountHandler("session", New(newDB(), []byte("secret")))
+	countFn := makeCountHandler("session", New(newDB(dbURI), []byte("secret")))
 	r1 := req(countFn, nil)
 	match(t, r1, 200, "1")
 	r2 := req(countFn, parseCookies(r1.Header().Get("Set-Cookie"))["session"])
@@ -126,7 +103,7 @@ func TestBasic(t *testing.T) {
 }
 
 func TestExpire(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := New(db, []byte("secret"))
 	countFn := makeCountHandler("session", store)
 
@@ -136,7 +113,7 @@ func TestExpire(t *testing.T) {
 	// test still in db but expired
 	id := r1.Header().Get("X-Session")
 	s := findSession(db, store, id)
-	s.ExpiresAt = gorm.NowFunc().Add(-40 * 24 * time.Hour)
+	s.ExpiresAt = time.Now().Add(-40 * 24 * time.Hour)
 	db.Save(s)
 
 	r2 := req(countFn, parseCookies(r1.Header().Get("Set-Cookie"))["session"])
@@ -150,7 +127,7 @@ func TestExpire(t *testing.T) {
 }
 
 func TestBrokenCookie(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := New(db, []byte("secret"))
 	countFn := makeCountHandler("session", store)
 
@@ -164,7 +141,7 @@ func TestBrokenCookie(t *testing.T) {
 }
 
 func TestMaxAgeNegative(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := New(db, []byte("secret"))
 	countFn := makeCountHandler("session", store)
 
@@ -196,7 +173,7 @@ func TestMaxAgeNegative(t *testing.T) {
 }
 
 func TestMaxLength(t *testing.T) {
-	store := New(newDB(), []byte("secret"))
+	store := New(newDB(dbURI), []byte("secret"))
 	store.MaxLength(10)
 
 	r1 := req(func(w http.ResponseWriter, r *http.Request) {
@@ -216,11 +193,11 @@ func TestMaxLength(t *testing.T) {
 }
 
 func TestTableName(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := NewOptions(db, Options{TableName: "abc"}, []byte("secret"))
 	countFn := makeCountHandler("session", store)
 
-	if !db.HasTable(&gormSession{tableName: store.opts.TableName}) {
+	if !db.Migrator().HasTable(&gormSession{tableName: store.opts.TableName}) {
 		t.Error("Expected abc table created")
 	}
 
@@ -231,7 +208,7 @@ func TestTableName(t *testing.T) {
 
 	id := r2.Header().Get("X-Session")
 	s := findSession(db, store, id)
-	s.ExpiresAt = gorm.NowFunc().Add(-time.Duration(store.SessionOpts.MaxAge+1) * time.Second)
+	s.ExpiresAt = time.Now().Add(-time.Duration(store.SessionOpts.MaxAge+1) * time.Second)
 	db.Save(s)
 
 	store.Cleanup()
@@ -242,16 +219,16 @@ func TestTableName(t *testing.T) {
 }
 
 func TestSkipCreateTable(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := NewOptions(db, Options{SkipCreateTable: true}, []byte("secret"))
 
-	if db.HasTable(&gormSession{tableName: store.opts.TableName}) {
+	if db.Migrator().HasTable(store.opts.TableName) {
 		t.Error("Expected no table created")
 	}
 }
 
 func TestMultiSessions(t *testing.T) {
-	store := New(newDB(), []byte("secret"))
+	store := New(newDB(dbURI), []byte("secret"))
 	countFn1 := makeCountHandler("session1", store)
 	countFn2 := makeCountHandler("session2", store)
 
@@ -267,7 +244,7 @@ func TestMultiSessions(t *testing.T) {
 }
 
 func TestPeriodicCleanup(t *testing.T) {
-	db := newDB()
+	db := newDB(dbURI)
 	store := New(db, []byte("secret"))
 	store.SessionOpts.MaxAge = 1
 	countFn := makeCountHandler("session", store)
